@@ -1,0 +1,5 @@
+{
+  "name": "Batch Image Resizer",
+  "description": "A high-performance, pure JavaScript tool for batch cropping and resizing images.",
+  "requestFramePermissions": []
+}
