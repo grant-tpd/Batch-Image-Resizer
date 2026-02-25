@@ -5,10 +5,13 @@ export class CropEngine {
   private ctx: CanvasRenderingContext2D;
   private image: HTMLImageElement | null = null;
   private cropRect: CropRect | null = null;
+  
   private isDragging = false;
   private dragStart: { x: number; y: number } | null = null;
-  private dragMode: 'move' | 'resize-tl' | 'resize-tr' | 'resize-bl' | 'resize-br' | null = null;
-  private animationFrameId: number | null = null;
+  private dragMode: 'move' | 'resize-tl' | 'resize-tr' | 'resize-bl' | 'resize-br' | 'pan' | null = null;
+  
+  // Viewport State
+  private view = { zoom: 1, panX: 0, panY: 0 };
   private onCropChange: (rect: CropRect) => void;
 
   constructor(canvas: HTMLCanvasElement, onCropChange: (rect: CropRect) => void) {
@@ -20,6 +23,8 @@ export class CropEngine {
 
   public setImage(img: HTMLImageElement) {
     this.image = img;
+    this.view = { zoom: 1, panX: 0, panY: 0 }; // Reset view
+    
     // Default crop: center square 80% of min dimension
     const minDim = Math.min(img.width, img.height);
     const size = minDim * 0.8;
@@ -41,12 +46,15 @@ export class CropEngine {
     this.canvas.addEventListener('mousedown', this.handleMouseDown.bind(this));
     window.addEventListener('mousemove', this.handleMouseMove.bind(this));
     window.addEventListener('mouseup', this.handleMouseUp.bind(this));
-    
+    this.canvas.addEventListener('wheel', this.handleWheel.bind(this), { passive: false });
+
     // Touch support
     this.canvas.addEventListener('touchstart', (e) => {
-      e.preventDefault(); // Prevent scrolling
-      const touch = e.touches[0];
-      this.handleMouseDown({ clientX: touch.clientX, clientY: touch.clientY } as MouseEvent);
+      if (e.touches.length === 1) {
+        e.preventDefault();
+        const touch = e.touches[0];
+        this.handleMouseDown({ clientX: touch.clientX, clientY: touch.clientY } as MouseEvent);
+      }
     }, { passive: false });
     
     window.addEventListener('touchmove', (e) => {
@@ -60,109 +68,210 @@ export class CropEngine {
     });
   }
 
-  private getCanvasScale() {
+  // --- Coordinate Systems ---
+
+  // 1. Mouse (Client) -> Canvas Pixel Space
+  private getMouseCanvasPos(e: { clientX: number, clientY: number }) {
+    const rect = this.canvas.getBoundingClientRect();
+    const scaleX = this.canvas.width / rect.width;
+    const scaleY = this.canvas.height / rect.height;
+    return {
+      x: (e.clientX - rect.left) * scaleX,
+      y: (e.clientY - rect.top) * scaleY
+    };
+  }
+
+  // 2. Image Space -> Canvas Pixel Space
+  private imageToCanvas(imgX: number, imgY: number) {
+    if (!this.image) return { x: 0, y: 0 };
+    
+    const baseScale = this.getBaseScale();
+    const totalScale = baseScale * this.view.zoom;
+    
+    // Center of canvas
+    const cx = this.canvas.width / 2;
+    const cy = this.canvas.height / 2;
+    
+    // Image center relative to image top-left
+    const imgCx = this.image.width / 2;
+    const imgCy = this.image.height / 2;
+    
+    return {
+      x: cx + this.view.panX + (imgX - imgCx) * totalScale,
+      y: cy + this.view.panY + (imgY - imgCy) * totalScale
+    };
+  }
+
+  // 3. Canvas Pixel Space -> Image Space
+  private canvasToImage(canvasX: number, canvasY: number) {
+    if (!this.image) return { x: 0, y: 0 };
+
+    const baseScale = this.getBaseScale();
+    const totalScale = baseScale * this.view.zoom;
+    
+    const cx = this.canvas.width / 2;
+    const cy = this.canvas.height / 2;
+    const imgCx = this.image.width / 2;
+    const imgCy = this.image.height / 2;
+
+    return {
+      x: imgCx + (canvasX - cx - this.view.panX) / totalScale,
+      y: imgCy + (canvasY - cy - this.view.panY) / totalScale
+    };
+  }
+
+  private getBaseScale() {
     if (!this.image) return 1;
-    // Fit image into canvas
-    const scaleX = this.canvas.width / this.image.width;
-    const scaleY = this.canvas.height / this.image.height;
-    return Math.min(scaleX, scaleY);
+    const margin = 40; // Padding around image
+    const w = this.canvas.width - margin * 2;
+    const h = this.canvas.height - margin * 2;
+    if (w <= 0 || h <= 0) return 1;
+    return Math.min(w / this.image.width, h / this.image.height);
   }
 
-  private imageToCanvas(x: number, y: number) {
-    const scale = this.getCanvasScale();
-    const offsetX = (this.canvas.width - this.image!.width * scale) / 2;
-    const offsetY = (this.canvas.height - this.image!.height * scale) / 2;
-    return {
-      x: x * scale + offsetX,
-      y: y * scale + offsetY,
-    };
-  }
+  private handleWheel(e: WheelEvent) {
+    e.preventDefault();
+    if (!this.image) return;
 
-  private canvasToImage(x: number, y: number) {
-    const scale = this.getCanvasScale();
-    const offsetX = (this.canvas.width - this.image!.width * scale) / 2;
-    const offsetY = (this.canvas.height - this.image!.height * scale) / 2;
-    return {
-      x: (x - offsetX) / scale,
-      y: (y - offsetY) / scale,
-    };
+    const zoomIntensity = 0.1;
+    const delta = e.deltaY > 0 ? -zoomIntensity : zoomIntensity;
+    const newZoom = Math.max(0.1, Math.min(10, this.view.zoom * (1 + delta)));
+
+    // Zoom towards mouse pointer
+    const mouse = this.getMouseCanvasPos(e);
+    const imgPosBefore = this.canvasToImage(mouse.x, mouse.y);
+    
+    this.view.zoom = newZoom;
+    
+    // Adjust pan to keep imgPos under mouse
+    // New canvas pos of that img point:
+    // x = cx + panX + (imgX - imgCx) * scale
+    // We want x to be mouse.x
+    // panX = mouse.x - cx - (imgX - imgCx) * scale
+    
+    const baseScale = this.getBaseScale();
+    const totalScale = baseScale * this.view.zoom;
+    const cx = this.canvas.width / 2;
+    const cy = this.canvas.height / 2;
+    const imgCx = this.image.width / 2;
+    const imgCy = this.image.height / 2;
+
+    this.view.panX = mouse.x - cx - (imgPosBefore.x - imgCx) * totalScale;
+    this.view.panY = mouse.y - cy - (imgPosBefore.y - imgCy) * totalScale;
+
+    this.render();
   }
 
   private handleMouseDown(e: MouseEvent) {
     if (!this.image || !this.cropRect) return;
 
-    const rect = this.canvas.getBoundingClientRect();
-    const mouseX = e.clientX - rect.left;
-    const mouseY = e.clientY - rect.top;
-
-    // Check handles first (in canvas coords)
-    const cropCanvas = this.imageToCanvas(this.cropRect.x, this.cropRect.y);
-    const cropW = this.cropRect.width * this.getCanvasScale();
-    const cropH = this.cropRect.height * this.getCanvasScale();
-
-    const handleSize = 10;
+    const mouse = this.getMouseCanvasPos(e);
     
-    // Helper to check hit
+    // Check handles first
+    const cropCanvas = this.imageToCanvas(this.cropRect.x, this.cropRect.y);
+    const cropBottomRight = this.imageToCanvas(this.cropRect.x + this.cropRect.width, this.cropRect.y + this.cropRect.height);
+    
+    const cropW = cropBottomRight.x - cropCanvas.x;
+    const cropH = cropBottomRight.y - cropCanvas.y;
+    
+    const handleSize = 12; // Slightly larger hit area
+    
     const hit = (x: number, y: number) => {
-      return Math.abs(mouseX - x) < handleSize && Math.abs(mouseY - y) < handleSize;
+      return Math.abs(mouse.x - x) < handleSize && Math.abs(mouse.y - y) < handleSize;
     };
 
+    // Handles
     if (hit(cropCanvas.x, cropCanvas.y)) this.dragMode = 'resize-tl';
     else if (hit(cropCanvas.x + cropW, cropCanvas.y)) this.dragMode = 'resize-tr';
     else if (hit(cropCanvas.x, cropCanvas.y + cropH)) this.dragMode = 'resize-bl';
     else if (hit(cropCanvas.x + cropW, cropCanvas.y + cropH)) this.dragMode = 'resize-br';
+    // Body
     else if (
-      mouseX > cropCanvas.x && mouseX < cropCanvas.x + cropW &&
-      mouseY > cropCanvas.y && mouseY < cropCanvas.y + cropH
+      mouse.x > cropCanvas.x && mouse.x < cropCanvas.x + cropW &&
+      mouse.y > cropCanvas.y && mouse.y < cropCanvas.y + cropH
     ) {
       this.dragMode = 'move';
-    } else {
-      return;
+    } 
+    // Background -> Pan
+    else {
+      this.dragMode = 'pan';
     }
 
     this.isDragging = true;
-    this.dragStart = { x: mouseX, y: mouseY };
+    this.dragStart = { x: mouse.x, y: mouse.y };
   }
 
   private handleMouseMove(e: MouseEvent) {
-    if (!this.isDragging || !this.image || !this.cropRect || !this.dragMode) return;
+    if (!this.isDragging || !this.image || !this.cropRect || !this.dragMode || !this.dragStart) return;
 
-    const rect = this.canvas.getBoundingClientRect();
-    const mouseX = e.clientX - rect.left;
-    const mouseY = e.clientY - rect.top;
-
-    const imgMouse = this.canvasToImage(mouseX, mouseY);
+    const mouse = this.getMouseCanvasPos(e);
     
-    // Clamp to image bounds
-    // ... (simplified for brevity, can add strict clamping)
+    if (this.dragMode === 'pan') {
+        const dx = mouse.x - this.dragStart.x;
+        const dy = mouse.y - this.dragStart.y;
+        this.view.panX += dx;
+        this.view.panY += dy;
+        this.dragStart = { x: mouse.x, y: mouse.y };
+        this.render();
+        return;
+    }
+
+    const currentImg = this.canvasToImage(mouse.x, mouse.y);
+    const startImg = this.canvasToImage(this.dragStart.x, this.dragStart.y);
+    
+    const dx = currentImg.x - startImg.x;
+    const dy = currentImg.y - startImg.y;
 
     if (this.dragMode === 'move') {
-        const dx = (mouseX - this.dragStart!.x) / this.getCanvasScale();
-        const dy = (mouseY - this.dragStart!.y) / this.getCanvasScale();
-        
         this.cropRect.x += dx;
         this.cropRect.y += dy;
         
-        // Clamp move
+        // Clamp
         this.cropRect.x = Math.max(0, Math.min(this.image.width - this.cropRect.width, this.cropRect.x));
         this.cropRect.y = Math.max(0, Math.min(this.image.height - this.cropRect.height, this.cropRect.y));
-
-        this.dragStart = { x: mouseX, y: mouseY };
+        
+        this.dragStart = { x: mouse.x, y: mouse.y }; // Reset drag start to avoid accumulation errors if we wanted, but here we used delta from last frame effectively by resetting dragStart
     } else {
         // Resize logic
-        // Simple implementation: just update rect based on corner
-        // Needs to handle aspect ratio if locked (not implemented here yet)
+        // We need to handle corners. 
+        // Simple approach: calculate new rect based on mouse pos and fixed opposite corner.
         
-        // Convert current mouse to image coords
-        const currentImg = this.canvasToImage(mouseX, mouseY);
+        let fixedX, fixedY;
         
         if (this.dragMode === 'resize-br') {
-            this.cropRect.width = Math.max(10, currentImg.x - this.cropRect.x);
-            this.cropRect.height = Math.max(10, currentImg.y - this.cropRect.y);
+            fixedX = this.cropRect.x;
+            fixedY = this.cropRect.y;
+            this.cropRect.width = Math.max(10, currentImg.x - fixedX);
+            this.cropRect.height = Math.max(10, currentImg.y - fixedY);
+        } else if (this.dragMode === 'resize-tl') {
+            fixedX = this.cropRect.x + this.cropRect.width;
+            fixedY = this.cropRect.y + this.cropRect.height;
+            const newX = Math.min(fixedX - 10, currentImg.x);
+            const newY = Math.min(fixedY - 10, currentImg.y);
+            this.cropRect.width = fixedX - newX;
+            this.cropRect.height = fixedY - newY;
+            this.cropRect.x = newX;
+            this.cropRect.y = newY;
+        } else if (this.dragMode === 'resize-tr') {
+            fixedX = this.cropRect.x;
+            fixedY = this.cropRect.y + this.cropRect.height;
+            const newY = Math.min(fixedY - 10, currentImg.y);
+            this.cropRect.width = Math.max(10, currentImg.x - fixedX);
+            this.cropRect.height = fixedY - newY;
+            this.cropRect.y = newY;
+        } else if (this.dragMode === 'resize-bl') {
+            fixedX = this.cropRect.x + this.cropRect.width;
+            fixedY = this.cropRect.y;
+            const newX = Math.min(fixedX - 10, currentImg.x);
+            this.cropRect.width = fixedX - newX;
+            this.cropRect.height = Math.max(10, currentImg.y - fixedY);
+            this.cropRect.x = newX;
         }
-        // ... other corners implementation would go here
-        // For brevity, implementing BR only or full resize logic is complex
-        // Let's implement a simpler "drag corner" logic
+        
+        // Clamp logic for resize could be added here to prevent going out of image bounds
+        // ...
+        
+        // We don't reset dragStart for resize because we calculate absolute positions from mouse
     }
     
     this.onCropChange(this.cropRect);
@@ -179,89 +288,68 @@ export class CropEngine {
     if (!this.ctx) return;
     
     // Clear
-    this.ctx.fillStyle = '#1f2937'; // gray-800
+    this.ctx.fillStyle = '#111827'; // gray-900
     this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
 
     if (!this.image) {
-        this.ctx.fillStyle = '#9ca3af'; // gray-400
+        this.ctx.fillStyle = '#9ca3af';
         this.ctx.font = '16px sans-serif';
         this.ctx.textAlign = 'center';
         this.ctx.fillText('No image loaded', this.canvas.width / 2, this.canvas.height / 2);
         return;
     }
 
-    const scale = this.getCanvasScale();
-    const offsetX = (this.canvas.width - this.image.width * scale) / 2;
-    const offsetY = (this.canvas.height - this.image.height * scale) / 2;
-    const drawW = this.image.width * scale;
-    const drawH = this.image.height * scale;
+    // Calculate draw coords
+    const topLeft = this.imageToCanvas(0, 0);
+    const bottomRight = this.imageToCanvas(this.image.width, this.image.height);
+    const drawW = bottomRight.x - topLeft.x;
+    const drawH = bottomRight.y - topLeft.y;
 
     // Draw Image
-    this.ctx.drawImage(this.image, offsetX, offsetY, drawW, drawH);
+    this.ctx.drawImage(this.image, topLeft.x, topLeft.y, drawW, drawH);
 
-    // Draw Overlay (Darken outside crop)
+    // Draw Overlay
     if (this.cropRect) {
-        this.ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
-        
-        // Full canvas
+        const cTL = this.imageToCanvas(this.cropRect.x, this.cropRect.y);
+        const cBR = this.imageToCanvas(this.cropRect.x + this.cropRect.width, this.cropRect.y + this.cropRect.height);
+        const cx = cTL.x;
+        const cy = cTL.y;
+        const cw = cBR.x - cTL.x;
+        const ch = cBR.y - cTL.y;
+
+        // Darken outside
+        this.ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
         this.ctx.beginPath();
         this.ctx.rect(0, 0, this.canvas.width, this.canvas.height);
-        
-        // Cut out crop
-        const cx = offsetX + this.cropRect.x * scale;
-        const cy = offsetY + this.cropRect.y * scale;
-        const cw = this.cropRect.width * scale;
-        const ch = this.cropRect.height * scale;
-        
         this.ctx.rect(cx, cy, cw, ch);
         this.ctx.clip('evenodd');
-        this.ctx.fill(); // Fills everything EXCEPT the crop rect due to evenodd rule if path is correct? 
-        // Actually, rect(0,0,w,h) then rect(cx,cy,cw,ch) with evenodd works if directions are same?
-        // Easier: Draw 4 rectangles around the crop
+        this.ctx.fill();
         
-        // Reset clip
-        // Actually, simpler way to draw overlay:
-        this.ctx.resetTransform(); // ensure identity
-        // Draw 4 dark rects
-        this.ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
-        // Top
-        this.ctx.fillRect(0, 0, this.canvas.width, cy);
-        // Bottom
-        this.ctx.fillRect(0, cy + ch, this.canvas.width, this.canvas.height - (cy + ch));
-        // Left
-        this.ctx.fillRect(0, cy, cx, ch);
-        // Right
-        this.ctx.fillRect(cx + cw, cy, this.canvas.width - (cx + cw), ch);
+        this.ctx.resetTransform(); // Reset clip
 
-        // Draw Crop Border
+        // Border
         this.ctx.strokeStyle = '#fff';
         this.ctx.lineWidth = 2;
         this.ctx.strokeRect(cx, cy, cw, ch);
 
-        // Draw Handles
+        // Handles
         this.ctx.fillStyle = '#fff';
         const handleSize = 8;
         const half = handleSize / 2;
         
-        // TL
-        this.ctx.fillRect(cx - half, cy - half, handleSize, handleSize);
-        // TR
-        this.ctx.fillRect(cx + cw - half, cy - half, handleSize, handleSize);
-        // BL
-        this.ctx.fillRect(cx - half, cy + ch - half, handleSize, handleSize);
-        // BR
-        this.ctx.fillRect(cx + cw - half, cy + ch - half, handleSize, handleSize);
+        this.ctx.fillRect(cx - half, cy - half, handleSize, handleSize); // TL
+        this.ctx.fillRect(cx + cw - half, cy - half, handleSize, handleSize); // TR
+        this.ctx.fillRect(cx - half, cy + ch - half, handleSize, handleSize); // BL
+        this.ctx.fillRect(cx + cw - half, cy + ch - half, handleSize, handleSize); // BR
         
-        // Grid lines (rule of thirds)
+        // Grid
         this.ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
         this.ctx.lineWidth = 1;
         this.ctx.beginPath();
-        // Verticals
         this.ctx.moveTo(cx + cw / 3, cy);
         this.ctx.lineTo(cx + cw / 3, cy + ch);
         this.ctx.moveTo(cx + 2 * cw / 3, cy);
         this.ctx.lineTo(cx + 2 * cw / 3, cy + ch);
-        // Horizontals
         this.ctx.moveTo(cx, cy + ch / 3);
         this.ctx.lineTo(cx + cw, cy + ch / 3);
         this.ctx.moveTo(cx, cy + 2 * ch / 3);
